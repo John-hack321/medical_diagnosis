@@ -18,6 +18,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import transformers
 from transformers import AutoTokenizer, AutoModel, pipeline
 from app.models.disease import Disease, Symptom
+from sklearn.model_selection import cross_validate
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,87 +43,219 @@ class SymptomDataset(Dataset):
 
 
 class NeuralDiagnosisModel(nn.Module):
-    """Neural network for disease diagnosis based on symptom vectors"""
+    """Neural network for disease diagnosis based on symptom vectors with attention mechanism"""
     
-    def __init__(self, input_size, hidden_size, output_size, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_size, output_size, dropout_rate=0.3, num_heads=4):
         super(NeuralDiagnosisModel, self).__init__()
-        # Design a 3-layer neural network
-        self.layer1 = nn.Linear(input_size, hidden_size*2)
-        self.layer2 = nn.Linear(hidden_size*2, hidden_size)
-        self.layer3 = nn.Linear(hidden_size, output_size)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.bn1 = nn.BatchNorm1d(hidden_size*2)
-        self.bn2 = nn.BatchNorm1d(hidden_size)
+        
+        # Input projection
+        self.input_proj = nn.Linear(input_size, hidden_size)
+        
+        # Multi-head self-attention
+        self.attention = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout_rate)
+        
+        # Residual blocks
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(hidden_size, dropout_rate) for _ in range(3)
+        ])
+        
+        # Output layers
+        self.output_layers = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_size // 2, output_size)
+        )
+        
+        # Layer normalization
+        self.layer_norm1 = nn.LayerNorm(hidden_size)
+        self.layer_norm2 = nn.LayerNorm(hidden_size)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using Xavier uniform initialization"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, x):
-        x = self.layer1(x)
-        x = self.bn1(x)
-        x = F.relu(x)
-        x = self.dropout(x)
+        # Input projection
+        x = self.input_proj(x)
         
-        x = self.layer2(x)
-        x = self.bn2(x)
-        x = F.relu(x)
-        x = self.dropout(x)
+        # Reshape for attention (batch_size, seq_len, hidden_size)
+        x = x.unsqueeze(1)
         
-        x = self.layer3(x)
+        # Self-attention
+        attn_output, _ = self.attention(x, x, x)
+        x = self.layer_norm1(x + attn_output)
+        
+        # Residual blocks
+        for res_block in self.res_blocks:
+            x = res_block(x)
+        
+        # Final layer norm
+        x = self.layer_norm2(x)
+        
+        # Output layers
+        x = x.squeeze(1)  # Remove sequence dimension
+        x = self.output_layers(x)
+        
         return x
 
 
+class ResidualBlock(nn.Module):
+    """Residual block with skip connection"""
+    
+    def __init__(self, hidden_size, dropout_rate):
+        super(ResidualBlock, self).__init__()
+        
+        self.layers = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+    
+    def forward(self, x):
+        return x + self.layers(x)
+
+
 class MedicalLanguageProcessor:
-    """NLP processor for medical text using transformer models"""
+    """NLP processor for medical text using transformer models with enhanced medical knowledge"""
     
     def __init__(self):
-        """Initialize language models"""
-        # Load models for symptom extraction and semantic matching
+        """Initialize language models and medical knowledge base"""
         try:
+            # Load base medical language model
             self.tokenizer = AutoTokenizer.from_pretrained("microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext")
             self.model = AutoModel.from_pretrained("microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext").to(device)
-            self.nlp_pipeline = pipeline(
-                "text-classification", 
-                model="bionlp/bluebert-base-uncased-pubmed-semeval",
-                tokenizer="bionlp/bluebert-base-uncased-pubmed-semeval",
+            
+            # Load specialized medical NER model
+            self.ner_pipeline = pipeline(
+                "ner",
+                model="samrawal/bert-base-clinical-ner",
+                tokenizer="samrawal/bert-base-clinical-ner",
                 device=0 if torch.cuda.is_available() else -1
             )
+            
+            # Load medical QA model
+            self.qa_pipeline = pipeline(
+                "question-answering",
+                model="deepset/bert-base-cased-squad2",
+                tokenizer="deepset/bert-base-cased-squad2",
+                device=0 if torch.cuda.is_available() else -1
+            )
+            
+            # Initialize medical knowledge base
+            self.medical_knowledge = self._initialize_medical_knowledge()
+            
             self.language_model_ready = True
+            logger.info("Successfully loaded all medical language models")
+            
         except Exception as e:
             logger.error(f"Failed to load language models: {str(e)}. Using fallback methods.")
             self.language_model_ready = False
     
+    def _initialize_medical_knowledge(self) -> Dict[str, Any]:
+        """Initialize medical knowledge base with common patterns and relationships"""
+        return {
+            "symptom_patterns": {
+                "pain": r"(?:pain|ache|discomfort|soreness)",
+                "fever": r"(?:fever|temperature|hot|chills)",
+                "respiratory": r"(?:cough|breath|wheeze|chest)",
+                "gastrointestinal": r"(?:nausea|vomit|diarrhea|stomach)",
+                "neurological": r"(?:headache|dizzy|confusion|seizure)"
+            },
+            "severity_indicators": {
+                "mild": r"(?:mild|slight|minor|low)",
+                "moderate": r"(?:moderate|medium|average)",
+                "severe": r"(?:severe|intense|extreme|high)"
+            },
+            "temporal_patterns": {
+                "acute": r"(?:sudden|acute|immediate|recent)",
+                "chronic": r"(?:chronic|long-term|persistent|ongoing)",
+                "intermittent": r"(?:intermittent|occasional|periodic|recurring)"
+            }
+        }
+    
     def extract_symptoms_from_text(self, text: str, known_symptoms: Set[str]) -> List[str]:
-        """Extract symptoms from natural language text"""
+        """Extract symptoms from natural language text with enhanced medical context"""
         if not text.strip():
             return []
         
         extracted_symptoms = []
         
-        # Try transformer-based extraction if available
         if self.language_model_ready:
             try:
-                # Encode the text
-                encoded_input = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
-                with torch.no_grad():
-                    model_output = self.model(**encoded_input)
+                # Use NER to identify medical entities
+                ner_results = self.ner_pipeline(text)
                 
-                # Use transformer embeddings for more powerful symptom extraction
-                # For real projects, this would be a fine-tuned named entity recognition model
-                sentences = self._split_into_sentences(text)
+                # Process NER results
+                for entity in ner_results:
+                    if entity['entity'] in ['PROBLEM', 'TEST', 'TREATMENT']:
+                        # Check if entity matches known symptoms
+                        for symptom in known_symptoms:
+                            if self._is_semantic_match(entity['word'], symptom):
+                                extracted_symptoms.append(symptom)
                 
-                for sentence in sentences:
-                    # Check each known symptom against this sentence
-                    for symptom in known_symptoms:
-                        if self._is_semantic_match(sentence.lower(), symptom.lower()):
-                            extracted_symptoms.append(symptom)
+                # Use medical knowledge patterns
+                for category, pattern in self.medical_knowledge['symptom_patterns'].items():
+                    matches = re.finditer(pattern, text.lower())
+                    for match in matches:
+                        context = self._extract_context(text, match.start(), match.end())
+                        for symptom in known_symptoms:
+                            if self._is_semantic_match(context, symptom):
+                                extracted_symptoms.append(symptom)
+                
+                # Add severity and temporal information
+                extracted_symptoms = self._add_symptom_metadata(extracted_symptoms, text)
                 
             except Exception as e:
-                logger.error(f"Error using language model for symptom extraction: {str(e)}")
-                # Fall back to regex approach
+                logger.error(f"Error in advanced symptom extraction: {str(e)}")
                 extracted_symptoms = self._extract_symptoms_regex(text, known_symptoms)
         else:
-            # Use regex approach as fallback
             extracted_symptoms = self._extract_symptoms_regex(text, known_symptoms)
         
-        return list(set(extracted_symptoms))  # Remove duplicates
+        return list(set(extracted_symptoms))
+    
+    def _extract_context(self, text: str, start: int, end: int, window: int = 50) -> str:
+        """Extract context around a matched term"""
+        context_start = max(0, start - window)
+        context_end = min(len(text), end + window)
+        return text[context_start:context_end]
+    
+    def _add_symptom_metadata(self, symptoms: List[str], text: str) -> List[str]:
+        """Add severity and temporal information to symptoms"""
+        enhanced_symptoms = []
+        
+        for symptom in symptoms:
+            # Check severity
+            severity = "moderate"  # default
+            for level, pattern in self.medical_knowledge['severity_indicators'].items():
+                if re.search(pattern, text.lower()):
+                    severity = level
+                    break
+            
+            # Check temporal pattern
+            temporal = "acute"  # default
+            for pattern, regex in self.medical_knowledge['temporal_patterns'].items():
+                if re.search(regex, text.lower()):
+                    temporal = pattern
+                    break
+            
+            # Add metadata to symptom
+            enhanced_symptoms.append(f"{symptom}_{severity}_{temporal}")
+        
+        return enhanced_symptoms
     
     def _extract_symptoms_regex(self, text: str, known_symptoms: Set[str]) -> List[str]:
         """Extract symptoms using regex patterns when transformer model is unavailable"""
@@ -265,7 +398,7 @@ class DiagnosisEngine:
             self.models_trained = False
     
     def _prepare_and_train_models(self) -> None:
-        """Prepare data and train ML models"""
+        """Prepare data and train ML models with enhanced validation and metrics"""
         # Get symptom-disease relationships from database
         diseases = self.db.query(Disease).all()
         
@@ -298,44 +431,160 @@ class DiagnosisEngine:
         self.disease_label_encoder = {idx: disease for disease, idx in disease_label_map.items()}
         disease_labels = [disease_label_map[disease] for disease in disease_names]
         
-        # Train Decision Tree
-        self.decision_tree = DecisionTreeClassifier(max_depth=10)
-        self.decision_tree.fit(symptom_vectors, disease_labels)
+        # Convert to PyTorch tensors
+        X = torch.FloatTensor(symptom_vectors.toarray())
+        y = torch.LongTensor(disease_labels)
         
-        # Train Neural Network
+        # Split data into train and validation sets
+        train_size = int(0.8 * len(X))
+        indices = torch.randperm(len(X))
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
+        
+        X_train, X_val = X[train_indices], X[val_indices]
+        y_train, y_val = y[train_indices], y[val_indices]
+        
+        # Create datasets
+        train_dataset = SymptomDataset(X_train, y_train)
+        val_dataset = SymptomDataset(X_val, y_val)
+        
+        # Create data loaders
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=32)
+        
+        # Initialize models
         input_size = len(all_symptoms)
-        hidden_size = max(50, len(all_symptoms) // 3)  # Heuristic for hidden size
-        output_size = len(set(disease_labels))
+        hidden_size = 256
+        output_size = len(disease_label_map)
         
-        # Create dataset
-        dataset = SymptomDataset(symptom_vectors, disease_labels)
-        dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
-        
-        # Initialize and train neural network
-        self.neural_net = NeuralDiagnosisModel(input_size, hidden_size, output_size)
-        self.neural_net.to(device)
+        self.neural_net = NeuralDiagnosisModel(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            output_size=output_size,
+            dropout_rate=0.3
+        ).to(device)
         
         # Training parameters
         criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(self.neural_net.parameters(), lr=0.001)
+        optimizer = torch.optim.AdamW(self.neural_net.parameters(), lr=0.001, weight_decay=0.01)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=3)
         
-        # Train for a few epochs
-        self.neural_net.train()
-        for epoch in range(20):
-            running_loss = 0.0
-            for symptoms, labels in dataloader:
-                symptoms, labels = symptoms.to(device), labels.to(device)
+        # Training loop with validation
+        best_val_f1 = 0
+        patience = 5
+        patience_counter = 0
+        
+        for epoch in range(50):
+            # Training phase
+            self.neural_net.train()
+            train_loss = 0
+            train_preds = []
+            train_true = []
+            
+            for batch_X, batch_y in train_loader:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
                 
                 optimizer.zero_grad()
-                outputs = self.neural_net(symptoms)
-                loss = criterion(outputs, labels)
+                outputs = self.neural_net(batch_X)
+                loss = criterion(outputs, batch_y)
                 loss.backward()
                 optimizer.step()
                 
-                running_loss += loss.item()
+                train_loss += loss.item()
+                train_preds.extend(outputs.argmax(dim=1).cpu().numpy())
+                train_true.extend(batch_y.cpu().numpy())
             
-            if epoch % 5 == 0:
-                logger.info(f"Epoch {epoch+1}/20, Loss: {running_loss/len(dataloader):.4f}")
+            # Validation phase
+            self.neural_net.eval()
+            val_loss = 0
+            val_preds = []
+            val_true = []
+            
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader:
+                    batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                    outputs = self.neural_net(batch_X)
+                    loss = criterion(outputs, batch_y)
+                    
+                    val_loss += loss.item()
+                    val_preds.extend(outputs.argmax(dim=1).cpu().numpy())
+                    val_true.extend(batch_y.cpu().numpy())
+            
+            # Calculate metrics
+            train_metrics = self._calculate_metrics(train_true, train_preds)
+            val_metrics = self._calculate_metrics(val_true, val_preds)
+            
+            # Log metrics
+            logger.info(f"Epoch {epoch+1}/50:")
+            logger.info(f"Train - Loss: {train_loss/len(train_loader):.4f}, "
+                       f"Accuracy: {train_metrics['accuracy']:.4f}, "
+                       f"F1: {train_metrics['f1']:.4f}")
+            logger.info(f"Val - Loss: {val_loss/len(val_loader):.4f}, "
+                       f"Accuracy: {val_metrics['accuracy']:.4f}, "
+                       f"F1: {val_metrics['f1']:.4f}")
+            
+            # Learning rate scheduling
+            scheduler.step(val_metrics['f1'])
+            
+            # Early stopping
+            if val_metrics['f1'] > best_val_f1:
+                best_val_f1 = val_metrics['f1']
+                patience_counter = 0
+                # Save best model
+                torch.save(self.neural_net.state_dict(), 'best_model.pt')
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    logger.info("Early stopping triggered")
+                    break
+        
+        # Load best model
+        self.neural_net.load_state_dict(torch.load('best_model.pt'))
+        
+        # Train decision tree
+        self.decision_tree = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=10,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            class_weight='balanced'
+        )
+        
+        # Train with cross-validation
+        cv_scores = cross_validate(
+            self.decision_tree,
+            symptom_vectors,
+            disease_labels,
+            cv=5,
+            scoring={
+                'accuracy': 'accuracy',
+                'precision': 'precision_weighted',
+                'recall': 'recall_weighted',
+                'f1': 'f1_weighted'
+            }
+        )
+        
+        # Log cross-validation results
+        logger.info("Decision Tree Cross-validation Results:")
+        for metric, scores in cv_scores.items():
+            logger.info(f"{metric}: {scores.mean():.4f} (+/- {scores.std() * 2:.4f})")
+        
+        # Final fit on all data
+        self.decision_tree.fit(symptom_vectors, disease_labels)
+    
+    def _calculate_metrics(self, true_labels, pred_labels) -> Dict[str, float]:
+        """Calculate comprehensive metrics for model evaluation"""
+        accuracy = accuracy_score(true_labels, pred_labels)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            true_labels, pred_labels, average='weighted'
+        )
+        
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1
+        }
     
     def _save_models(self, path: str) -> None:
         """Save trained models to disk"""
